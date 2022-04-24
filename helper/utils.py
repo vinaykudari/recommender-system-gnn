@@ -1,55 +1,11 @@
 import random
-import os, sys, pdb, math, time
-import multiprocessing as mp
 
 import numpy as np
-from tqdm import tqdm
+import pandas as pd
+import scipy.sparse as sp
 import torch
 import scipy.sparse as ssp
-from torch_geometric.data import Data, Dataset, InMemoryDataset
-
-class MyDataset(InMemoryDataset):
-    def __init__(self, A, links, labels, h, sample_ratio, max_nodes_per_hop, 
-                 u_features, v_features, class_values, max_num=None, parallel=False, root='data/movie-lens/ml-latest-small/'):
-        self.Arow = SparseRowIndexer(A)
-        self.Acol = SparseColIndexer(A.tocsc())
-        self.links = links
-        self.labels = labels
-        self.h = h
-        self.sample_ratio = sample_ratio
-        self.max_nodes_per_hop = max_nodes_per_hop
-        self.u_features = u_features
-        self.v_features = v_features
-        self.class_values = class_values
-        self.parallel = parallel
-        self.max_num = max_num
-        if max_num is not None:
-            np.random.seed(123)
-            num_links = len(links[0])
-            perm = np.random.permutation(num_links)
-            perm = perm[:max_num]
-            self.links = (links[0][perm], links[1][perm])
-            self.labels = labels[perm]
-        super(MyDataset, self).__init__(root)
-        self.data, self.slices = torch.load(self.processed_paths[0])
-
-    @property
-    def processed_file_names(self):
-        name = 'data.pt'
-        if self.max_num is not None:
-            name = 'data_{}.pt'.format(self.max_num)
-        return [name]
-
-    def process(self):
-        # Extract enclosing subgraphs and save to disk
-        data_list = links2subgraphs(self.Arow, self.Acol, self.links, self.labels, self.h, 
-                                    self.sample_ratio, self.max_nodes_per_hop, 
-                                    self.u_features, self.v_features, 
-                                    self.class_values, self.parallel)
-
-        data, slices = self.collate(data_list)
-        torch.save((data, slices), self.processed_paths[0])
-        del data_list
+from torch_geometric.data import Data, InMemoryDataset
 
 
 class SparseRowIndexer:
@@ -101,12 +57,118 @@ class SparseColIndexer:
         return ssp.csc_matrix((data, indices, indptr), shape=shape)
 
 
+def map_data(data):
+    uniq = list(set(data))
+    id_dict = {old: new for new, old in enumerate(sorted(uniq))}
+    data = np.array([id_dict[x] for x in data])
+    n = len(uniq)
+
+    return data, id_dict, n
+
+
+def shuffle_df(df):
+    rand_idx = np.random.randint(0, df.shape[0], df.shape[0])
+    df = df.iloc[rand_idx, :].reset_index(drop=True)
+    return df
+
+
+def get_nodes(df_ratings):
+    df_ratings = shuffle_df(df_ratings)
+    rated_users = df_ratings.values[:, 0]
+    rated_items = df_ratings.values[:, 1]
+    ratings = df_ratings.values[:, 2]
+
+    rated_users, rated_users_dict, num_users = map_data(rated_users)
+    rated_items, rated_items_dict, num_items = map_data(rated_items)
+
+    return rated_users, rated_users_dict, num_users, rated_items, rated_items_dict, num_items, ratings
+
+
+def get_user_features(df_ratings, df_items, genres, genres_map, rated_users_dict, n, sparse=False):
+    n_users = len(df_ratings.userId.unique())
+    f_len = len(genres_map)
+    merged = pd.merge(df_ratings, df_items).drop(labels=['title', 'movieId', 'rating', 'feature'], axis=1)
+    grouped = merged.groupby('userId')[genres].mean()
+    y = grouped.apply(lambda x: pd.Series((x.nlargest(n))), axis=1).notna().reset_index()
+
+    user_features = np.zeros((n_users, f_len))
+    for i in range(y.shape[0]):
+        temp = [0] * f_len
+        for col in y.columns:
+            if y.loc[i, col] is True:
+                if col in genres_map:
+                    user_features[rated_users_dict[y.loc[i, 'userId']], genres_map[col]] = 1
+
+    if sparse:
+        user_features = sp.csr_matrix(user_features)
+
+    return user_features
+
+
+def get_item_features(df_items, idx_map, sparse=False):
+    n_items = df_items.shape[0]
+    f_len = len(list(df_items.loc[0, 'feature']))
+    item_features = np.zeros((n_items, f_len), dtype=np.float32)
+
+    for movie_id, feature_vec in df_items[['movieId', 'feature']].values.tolist():
+        if movie_id in idx_map:
+            item_features[idx_map[movie_id], :] = list(feature_vec)
+
+    if sparse:
+        item_features = sp.csr_matrix(item_features)
+
+    return item_features
+
+
+def process_movies(df_movies):
+    genres = set()
+    lists = df_movies.genres.values
+    mp = {}
+
+    def encode(movie_genres):
+        res = []
+        for idx, genre in enumerate(genres):
+            if genre in movie_genres:
+                res.append(1)
+            else:
+                res.append(0)
+            mp[genre] = idx
+        return res + [''.join([str(i) for i in res])]
+
+    for idx, lis in enumerate(lists):
+        for genre in lis.split('|'):
+            genres.add(genre)
+
+    genres = sorted(genres)
+    df_movies[genres + ['feature']] = df_movies.apply(lambda x: encode(x.genres), 1).values.tolist()
+
+    return df_movies.drop(labels='genres', axis=1), genres, mp
+
+
+def split(data, rating_dict, ratio=0.8):
+    rated_users, rated_items, ratings = data
+    n = rated_items.shape[0]
+    n_train = int(n * ratio)
+    stacked = np.vstack([rated_users, rated_items]).T
+    train_pairs_idx = stacked[:n_train]
+    test_pairs_idx = stacked[n_train:]
+
+    user_train_idx, item_train_idx = train_pairs_idx.transpose()
+    user_test_idx, item_test_idx = test_pairs_idx.transpose()
+
+    labels = np.array([rating_dict[r] for r in ratings], dtype=np.int32)
+    train_labels = labels[:n_train]
+    test_labels = labels[n_train:]
+
+    return user_train_idx, item_train_idx, user_test_idx, item_test_idx, train_labels, test_labels
+
+
 def construct_pyg_graph(u, v, r, node_labels, max_node_label, y, node_features):
     u, v = torch.LongTensor(u), torch.LongTensor(v)
-    r = torch.LongTensor(r)  
+    r = torch.LongTensor(r)
     edge_index = torch.stack([torch.cat([u, v]), torch.cat([v, u])], 0)
     edge_type = torch.cat([r, r])
-    x = torch.FloatTensor(one_hot(node_labels, max_node_label+1))
+    x = torch.FloatTensor(one_hot(node_labels, max_node_label + 1))
     y = torch.FloatTensor([y])
     data = Data(x, edge_index, edge_type=edge_type, y=y)
 
@@ -121,23 +183,23 @@ def construct_pyg_graph(u, v, r, node_labels, max_node_label, y, node_features):
     return data
 
 
-def subgraph_extraction_labeling(ind, Arow, Acol, h=1, sample_ratio=1.0, max_nodes_per_hop=None, 
-                                 u_features=None, v_features=None, class_values=None, 
+def subgraph_extraction_labeling(ind, Arow, Acol, h=1, sample_ratio=1.0, max_nodes_per_hop=None,
+                                 u_features=None, v_features=None, class_values=None,
                                  y=1):
     # extract the h-hop enclosing subgraph around link 'ind'
     u_nodes, v_nodes = [ind[0]], [ind[1]]
     u_dist, v_dist = [0], [0]
-    u_visited, v_visited = set([ind[0]]), set([ind[1]])
-    u_fringe, v_fringe = set([ind[0]]), set([ind[1]])
-    for dist in range(1, h+1):
+    u_visited, v_visited = {ind[0]}, {ind[1]}
+    u_fringe, v_fringe = {ind[0]}, {ind[1]}
+    for dist in range(1, h + 1):
         v_fringe, u_fringe = neighbors(u_fringe, Arow), neighbors(v_fringe, Acol)
         u_fringe = u_fringe - u_visited
         v_fringe = v_fringe - v_visited
         u_visited = u_visited.union(u_fringe)
         v_visited = v_visited.union(v_fringe)
         if sample_ratio < 1.0:
-            u_fringe = random.sample(u_fringe, int(sample_ratio*len(u_fringe)))
-            v_fringe = random.sample(v_fringe, int(sample_ratio*len(v_fringe)))
+            u_fringe = random.sample(u_fringe, int(sample_ratio * len(u_fringe)))
+            v_fringe = random.sample(v_fringe, int(sample_ratio * len(v_fringe)))
         if max_nodes_per_hop is not None:
             if max_nodes_per_hop < len(u_fringe):
                 u_fringe = random.sample(u_fringe, max_nodes_per_hop)
@@ -152,105 +214,48 @@ def subgraph_extraction_labeling(ind, Arow, Acol, h=1, sample_ratio=1.0, max_nod
     subgraph = Arow[u_nodes][:, v_nodes]
     # remove link between target nodes
     subgraph[0, 0] = 0
-    
+
     # prepare pyg graph constructor input
     u, v, r = ssp.find(subgraph)  # r is 1, 2... (rating labels + 1)
     v += len(u_nodes)
     r = r - 1  # transform r back to rating label
     num_nodes = len(u_nodes) + len(v_nodes)
-    node_labels = [x*2 for x in u_dist] + [x*2+1 for x in v_dist]
-    max_node_label = 2*h + 1
+    node_labels = [x * 2 for x in u_dist] + [x * 2 + 1 for x in v_dist]
+    max_node_label = 2 * h + 1
     y = class_values[y]
-    
+
     # get node features
     if u_features is not None:
         u_features = u_features[u_nodes]
     if v_features is not None:
         v_features = v_features[v_nodes]
     node_features = None
-    if False: 
-        # directly use padded node features
-        if u_features is not None and v_features is not None:
-            u_extended = np.concatenate(
-                [u_features, np.zeros([u_features.shape[0], v_features.shape[1]])], 1
-            )
-            v_extended = np.concatenate(
-                [np.zeros([v_features.shape[0], u_features.shape[1]]), v_features], 1
-            )
-            node_features = np.concatenate([u_extended, v_extended], 0)
-    if False:
-        # use identity features (one-hot encodings of node idxes)
-        u_ids = one_hot(u_nodes, Arow.shape[0] + Arow.shape[1])
-        v_ids = one_hot([x+Arow.shape[0] for x in v_nodes], Arow.shape[0] + Arow.shape[1])
-        node_ids = np.concatenate([u_ids, v_ids], 0)
-        #node_features = np.concatenate([node_features, node_ids], 1)
-        node_features = node_ids
-    if True:
-        # only output node features for the target user and item
-        if u_features is not None and v_features is not None:
-            node_features = [u_features[0], v_features[0]]
-            
+
+    # if False:
+    #     # directly use padded node features
+    #     if u_features is not None and v_features is not None:
+    #         u_extended = np.concatenate(
+    #             [u_features, np.zeros([u_features.shape[0], v_features.shape[1]])], 1
+    #         )
+    #         v_extended = np.concatenate(
+    #             [np.zeros([v_features.shape[0], u_features.shape[1]]), v_features], 1
+    #         )
+    #         node_features = np.concatenate([u_extended, v_extended], 0)
+    # if False:
+    #     # use identity features (one-hot encodings of node idxes)
+    #     u_ids = one_hot(u_nodes, Arow.shape[0] + Arow.shape[1])
+    #     v_ids = one_hot([x + Arow.shape[0] for x in v_nodes], Arow.shape[0] + Arow.shape[1])
+    #     node_ids = np.concatenate([u_ids, v_ids], 0)
+    #     # node_features = np.concatenate([node_features, node_ids], 1)
+    #     node_features = node_ids
+    # if True:
+    #     # only output node features for the target user and item
+
+    if u_features is not None and v_features is not None:
+        node_features = [u_features[0], v_features[0]]
+
     return u, v, r, node_labels, max_node_label, y, node_features
 
-
-def links2subgraphs(Arow, 
-                    Acol, 
-                    links, 
-                    labels, 
-                    h=1, 
-                    sample_ratio=1.0, 
-                    max_nodes_per_hop=None, 
-                    u_features=None, 
-                    v_features=None, 
-                    class_values=None, 
-                    parallel=True):
-    # extract enclosing subgraphs
-    print('Enclosing subgraph extraction begins...')
-    g_list = []
-    if not parallel:
-        with tqdm(total=len(links[0])) as pbar:
-            for i, j, g_label in zip(links[0], links[1], labels):
-                tmp = subgraph_extraction_labeling(
-                    (i, j), Arow, Acol, h, sample_ratio, max_nodes_per_hop, u_features, 
-                    v_features, class_values, g_label
-                )
-                data = construct_pyg_graph(*tmp)
-                g_list.append(data)
-                pbar.update(1)
-    else:
-        start = time.time()
-        pool = mp.Pool(mp.cpu_count())
-        results = pool.starmap_async(
-            subgraph_extraction_labeling, 
-            [
-                ((i, j), Arow, Acol, h, sample_ratio, max_nodes_per_hop, u_features, 
-                v_features, class_values, g_label) 
-                for i, j, g_label in zip(links[0], links[1], labels)
-            ]
-        )
-        remaining = results._number_left
-        pbar = tqdm(total=remaining)
-        while True:
-            pbar.update(remaining - results._number_left)
-            if results.ready(): break
-            remaining = results._number_left
-            time.sleep(1)
-        results = results.get()
-        pool.close()
-        pbar.close()
-        end = time.time()
-        print("Time elapsed for subgraph extraction: {}s".format(end-start))
-        print("Transforming to pytorch_geometric graphs...")
-        g_list = []
-        pbar = tqdm(total=len(results))
-        while results:
-            tmp = results.pop()
-            g_list.append(construct_pyg_graph(*tmp))
-            pbar.update(1)
-        pbar.close()
-        end2 = time.time()
-        print("Time elapsed for transforming to pytorch_geometric graphs: {}s".format(end2-end))
-    return g_list
 
 def neighbors(fringe, A):
     if not fringe:

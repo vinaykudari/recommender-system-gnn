@@ -10,7 +10,7 @@ from torch_geometric.data import Data, Dataset, InMemoryDataset
 
 class MyDataset(InMemoryDataset):
     def __init__(self, A, links, labels, h, sample_ratio, max_nodes_per_hop, 
-                 u_features, v_features, class_values, max_num=None, parallel=False, root='data/movie-lens/ml-latest-small/'):
+                 u_features, v_features, class_values, max_num=None, parallel=False, root='raw_data/movie-lens/ml-latest-small/'):
         self.Arow = SparseRowIndexer(A)
         self.Acol = SparseColIndexer(A.tocsc())
         self.links = links
@@ -35,7 +35,7 @@ class MyDataset(InMemoryDataset):
 
     @property
     def processed_file_names(self):
-        name = 'data.pt'
+        name = 'raw_data.pt'
         if self.max_num is not None:
             name = 'data_{}.pt'.format(self.max_num)
         return [name]
