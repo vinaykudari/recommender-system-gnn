@@ -57,31 +57,42 @@ class SparseColIndexer:
         return ssp.csc_matrix((data, indices, indptr), shape=shape)
 
 
-def map_data(data):
+def map_data(data, return_reverse=False):
     uniq = list(set(data))
     id_dict = {old: new for new, old in enumerate(sorted(uniq))}
+    rev_id_dict = {new: old for new, old in enumerate(sorted(uniq))}
     data = np.array([id_dict[x] for x in data])
     n = len(uniq)
+
+    if return_reverse:
+        return data, id_dict, rev_id_dict, n
 
     return data, id_dict, n
 
 
-def shuffle_df(df):
+def n_round(arr, n):
+    return torch.div(arr, n, rounding_mode='floor') * n
+
+
+def shuffle_df(df, drop=True):
     rand_idx = np.random.randint(0, df.shape[0], df.shape[0])
-    df = df.iloc[rand_idx, :].reset_index(drop=True)
+    if drop:
+        df = df.iloc[rand_idx, :].reset_index(drop=True)
+    else:
+        df = df.iloc[rand_idx, :]
     return df
 
 
-def get_nodes(df_ratings):
+def get_nodes(df_ratings, return_reverse=False):
     df_ratings = shuffle_df(df_ratings)
     rated_users = df_ratings.values[:, 0]
     rated_items = df_ratings.values[:, 1]
     ratings = df_ratings.values[:, 2]
 
-    rated_users, rated_users_dict, num_users = map_data(rated_users)
-    rated_items, rated_items_dict, num_items = map_data(rated_items)
+    users_tuple = map_data(rated_users, return_reverse)
+    items_tuple = map_data(rated_items, return_reverse)
 
-    return rated_users, rated_users_dict, num_users, rated_items, rated_items_dict, num_items, ratings
+    return users_tuple, items_tuple, ratings
 
 
 def get_user_features(df_ratings, df_items, genres, genres_map, rated_users_dict, n, sparse=False):
@@ -93,7 +104,6 @@ def get_user_features(df_ratings, df_items, genres, genres_map, rated_users_dict
 
     user_features = np.zeros((n_users, f_len))
     for i in range(y.shape[0]):
-        temp = [0] * f_len
         for col in y.columns:
             if y.loc[i, col] is True:
                 if col in genres_map:

@@ -2,7 +2,7 @@ from typing import Union, List, Tuple
 
 import numpy as np
 from torch_geometric.data import Data, Dataset
-from helper.utils import *
+from helper.igmc_utils import *
 
 
 class MovieLensDataset(Dataset):
