@@ -157,20 +157,36 @@ def get_nodes(df_ratings, return_reverse=False):
     return users_tuple, items_tuple, ratings
 
 
-def get_user_features(df_ratings, df_items, genres, genres_map, rated_users_dict, n, sparse=False):
+def get_user_features(
+    df_ratings, df_items, genres, 
+    genres_map, rated_users_dict, 
+    n, use_embeddings=False, sparse=False,
+):
     n_users = len(df_ratings.userId.unique())
     f_len = len(genres_map)
     merged = pd.merge(df_ratings, df_items).drop(labels=['title', 'movieId', 'rating', 'feature'], axis=1)
     grouped = merged.groupby('userId')[genres].mean()
     y = grouped.apply(lambda x: pd.Series((x.nlargest(n))), axis=1).notna().reset_index()
-
-    user_features = np.zeros((n_users, f_len))
-    for i in range(y.shape[0]):
-        for col in y.columns:
-            if y.loc[i, col] is True:
-                if col in genres_map:
-                    user_features[rated_users_dict[y.loc[i, 'userId']], genres_map[col]] = 1
-
+                    
+    if use_embeddings:
+        user_features = np.zeros((n_users, 768))
+        for i in range(y.shape[0]):
+            embeddings = []
+            for col in y.columns:
+                if col != 'userId' and  y.loc[i, col].astype(int) == 1:
+                    embed = get_bert_embedding(col)[0]
+                    embeddings.append(embed)
+                 
+            user_features[rated_users_dict[y.loc[i, 'userId']]] = np.mean(embeddings, axis=0).tolist()
+                    
+    else:
+        user_features = np.zeros((n_users, f_len))
+        for i in range(y.shape[0]):
+            for col in y.columns:
+                if col != 'userId' and  y.loc[i, col].astype(int) == 1:
+                    if col in genres_map:
+                        user_features[rated_users_dict[y.loc[i, 'userId']], genres_map[col]] = 1
+        
     if sparse:
         user_features = sp.csr_matrix(user_features)
 
