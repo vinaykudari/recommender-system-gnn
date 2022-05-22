@@ -29,7 +29,7 @@ class IGMC(torch.nn.Module):
                 ),
             )
 
-        self.emb = Embedding(90524,3233)
+        # self.emb = Embedding(90524,3233)
         self.rnn1 = LSTM(2 * sum(latent_dim),2 * sum(latent_dim),num_layers=2)
         self.lin1 = Linear(2 * sum(latent_dim), 128)
         self.side_features = side_features
@@ -48,8 +48,8 @@ class IGMC(torch.nn.Module):
 
     def forward(self, data):
         x, edge_index, edge_type, batch = data.x, data.edge_index, data.edge_type, data.batch
-        print(x)
-        print(x.shape)
+        # print(x)
+        # print(x.shape)
         # break
         if self.adj_dropout > 0:
             edge_index, edge_type = dropout_adj(
@@ -67,7 +67,7 @@ class IGMC(torch.nn.Module):
         # print(x.shape)
         # print(edge_index.shape)
         # print(edge_type.shape)
-        x = self.emb(x.long())
+        # x = self.emb(x.long())
         for conv in self.convs:
             x = torch.tanh(conv(x, edge_index, edge_type))
             concat_states.append(x)
@@ -81,7 +81,7 @@ class IGMC(torch.nn.Module):
         if self.side_features:
             x = torch.cat([x, data.u_feature, data.v_feature], 1)
         # print(x.shape)
-        # x,hidden = self.rnn1(x)
+        x,hidden = self.rnn1(x)
         # print(x.shape)
         # print(hidden.shape)
         x = F.relu(self.lin1(x))
